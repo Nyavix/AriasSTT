@@ -105,9 +105,22 @@ All knobs live at the top of `dictate.py`:
 | `MODEL_OPTIONS` | `["tiny.en", "base.en", "small.en", "medium.en", "large-v3"]` | Choices shown in the tray "Model" submenu. |
 | `CPU_THREADS` | `0` | `0` = let faster-whisper pick. Bumping this can help on machines with lots of cores. |
 
-After editing, just restart the app. Model and hotkey are exceptions — both
-are editable from the tray menu and persisted to
+After editing, just restart the app. Model, hotkey, and trigger mode are
+exceptions — all three are editable from the tray menu and persisted to
 `%LOCALAPPDATA%\AriasSTT\config.json` across restarts.
+
+### Trigger mode (Toggle vs Hold)
+
+Right-click the tray icon → **Mode**:
+
+- **Toggle** *(default)*: press the hotkey to start, press again to stop.
+  Best for paragraphs and longer dictations.
+- **Hold (PTT)**: hold the hotkey to record, release to transcribe. Best for
+  short bursts and avoiding hot-mic moments.
+
+`MAX_RECORD_SECONDS` acts as a dead-man's switch in both modes — if the
+release is missed (hold mode) or the toggle is forgotten, recording auto-stops
+and transcribes after the cap.
 
 ### Switching models on the fly
 

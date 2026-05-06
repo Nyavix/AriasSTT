@@ -307,6 +307,50 @@ def probe_hotkey_conflict(spec: str) -> tuple[bool, str]:
     return True, ""
 
 
+# --- Hold-mode chord tracker (P2) --------------------------------------
+# pynput's built-in HotKey class only fires on chord activation (all keys
+# down). Hold-to-talk needs the deactivation edge too. _HoldChord is fed
+# canonical key events from a `keyboard.Listener` and emits engage/release
+# transitions exactly once per chord cycle.
+
+class _HoldChord:
+    """Tracks press/release transitions for a parsed pynput chord.
+
+    Edge-triggered: `on_engage` fires on the rising edge (full chord first
+    held), `on_release` fires on the falling edge (any target key released
+    while engaged). Auto-repeat key-presses do not retrigger engage.
+    """
+
+    def __init__(self, keys, on_engage, on_release):
+        self._target = set(keys)
+        self._held: set = set()
+        self._engaged: bool = False
+        self._on_engage = on_engage
+        self._on_release = on_release
+
+    def press(self, key) -> None:
+        if key not in self._target:
+            return
+        self._held.add(key)
+        if not self._engaged and self._held == self._target:
+            self._engaged = True
+            try:
+                self._on_engage()
+            except Exception as e:
+                log(f"hold on_engage error: {e}\n{traceback.format_exc()}")
+
+    def release(self, key) -> None:
+        if key not in self._target:
+            return
+        self._held.discard(key)
+        if self._engaged and self._held != self._target:
+            self._engaged = False
+            try:
+                self._on_release()
+            except Exception as e:
+                log(f"hold on_release error: {e}\n{traceback.format_exc()}")
+
+
 # ---------------------------------------------------------------------
 # Sound effects (synthesized in-memory WAV played via winsound)
 # ---------------------------------------------------------------------
@@ -991,12 +1035,29 @@ class DictateApp:
         if not is_valid_hotkey(self.current_hotkey):
             log(f"Persisted hotkey {self.current_hotkey!r} invalid; falling back to {HOTKEY}")
             self.current_hotkey = HOTKEY
-        self._hotkey_listener: keyboard.GlobalHotKeys | None = None
+
+        # P2: trigger mode -- "toggle" (press to start, press to stop) or
+        # "hold" (press-and-hold to record, release to stop).
+        self.current_mode: str = cfg.get("mode", "toggle")
+        if self.current_mode not in ("toggle", "hold"):
+            log(f"Persisted mode {self.current_mode!r} invalid; falling back to toggle")
+            self.current_mode = "toggle"
+
+        self._hotkey_listener = None  # keyboard.GlobalHotKeys or keyboard.Listener
         self._hotkey_bound: bool = False
         self._hotkey_last_error: str | None = None
 
+        # Dead-man's switch: forces a stop after MAX_RECORD_SECONDS even if
+        # the chord release is missed (relevant for hold mode, but covers
+        # toggle too).
+        self._max_record_timer: threading.Timer | None = None
+
     def _save_config(self) -> None:
-        save_user_config({"model": self.current_model, "hotkey": self.current_hotkey})
+        save_user_config({
+            "model":  self.current_model,
+            "hotkey": self.current_hotkey,
+            "mode":   self.current_mode,
+        })
 
     # -- model -------------------------------------------------------
 
@@ -1048,8 +1109,8 @@ class DictateApp:
     def _start_hotkey_listener(self) -> None:
         """Stop any existing listener and start a fresh one bound to current_hotkey.
 
-        On failure, marks `_hotkey_bound=False` and degrades the tray tooltip
-        so the user can still rebind via the menu.
+        Dispatches to the toggle or hold backend based on `current_mode`.
+        On failure, marks `_hotkey_bound=False` and degrades the tray tooltip.
         """
         if self._hotkey_listener is not None:
             try:
@@ -1058,12 +1119,15 @@ class DictateApp:
                 log(f"Stop old hotkey listener failed: {e}")
             self._hotkey_listener = None
         try:
-            listener = keyboard.GlobalHotKeys({self.current_hotkey: self.on_toggle})
+            if self.current_mode == "hold":
+                listener = self._build_hold_listener(self.current_hotkey)
+            else:
+                listener = keyboard.GlobalHotKeys({self.current_hotkey: self.on_toggle})
             listener.start()
             self._hotkey_listener = listener
             self._hotkey_bound = True
             self._hotkey_last_error = None
-            log(f"Hotkey listener bound to {self.current_hotkey}")
+            log(f"Hotkey listener bound: mode={self.current_mode} chord={self.current_hotkey}")
             self._refresh_tooltip()
         except Exception as e:
             self._hotkey_bound = False
@@ -1071,6 +1135,66 @@ class DictateApp:
             log(f"Hotkey listener crashed: {e}\n{traceback.format_exc()}")
             notify_error(APP_NAME, f"Hotkey error: {e}")
             self._refresh_tooltip()
+
+    def _build_hold_listener(self, spec: str) -> "keyboard.Listener":
+        """Build a `keyboard.Listener` driving a _HoldChord matcher."""
+        keys = keyboard.HotKey.parse(spec)
+        chord = _HoldChord(keys, self._on_hold_press, self._on_hold_release)
+        listener_holder: list = [None]
+
+        def on_press(key):
+            l = listener_holder[0]
+            if l is not None:
+                chord.press(l.canonical(key))
+
+        def on_release(key):
+            l = listener_holder[0]
+            if l is not None:
+                chord.release(l.canonical(key))
+
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener_holder[0] = listener
+        return listener
+
+    def _on_hold_press(self) -> None:
+        """Hold-mode: chord engaged -> start recording (if idle)."""
+        with self._state_lock:
+            if self.state != self.STATE_IDLE:
+                log(f"Hold-press ignored: state={self.state}")
+                return
+            self.state = self.STATE_RECORDING
+        self._start_recording()
+
+    def _on_hold_release(self) -> None:
+        """Hold-mode: chord released -> stop and transcribe (if recording)."""
+        with self._state_lock:
+            if self.state != self.STATE_RECORDING:
+                log(f"Hold-release ignored: state={self.state}")
+                return
+            self.state = self.STATE_BUSY
+        self._stop_and_transcribe()
+
+    def set_mode(self, mode: str) -> None:
+        """Tray callback: switch between toggle and hold modes."""
+        if mode == self.current_mode:
+            return
+        if mode not in ("toggle", "hold"):
+            notify_error(APP_NAME, f"Unknown mode: {mode}")
+            return
+        with self._state_lock:
+            if self.state != self.STATE_IDLE:
+                notify_error(APP_NAME, "Finish current dictation before switching modes.")
+                return
+        self.current_mode = mode
+        self._save_config()
+        self._start_hotkey_listener()
+        if self.icon is not None:
+            try:
+                self.icon.update_menu()
+            except Exception:
+                pass
+        log(f"Mode set to {mode}")
+        notify(APP_NAME, f"Mode: {mode}")
 
     def _refresh_tooltip(self) -> None:
         """Update tray tooltip based on listener health + current model."""
@@ -1246,6 +1370,34 @@ class DictateApp:
             self.overlay.show("recording")
         play_sound("start")
         log("Recording started.")
+        # Dead-man's switch: force a stop after MAX_RECORD_SECONDS so a missed
+        # release in hold mode (or a forgotten toggle) can't run forever.
+        self._arm_max_record_timer()
+
+    def _arm_max_record_timer(self) -> None:
+        self._cancel_max_record_timer()
+        timer = threading.Timer(MAX_RECORD_SECONDS, self._auto_stop)
+        timer.daemon = True
+        timer.start()
+        self._max_record_timer = timer
+
+    def _cancel_max_record_timer(self) -> None:
+        t = self._max_record_timer
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            self._max_record_timer = None
+
+    def _auto_stop(self) -> None:
+        with self._state_lock:
+            if self.state != self.STATE_RECORDING:
+                return
+            self.state = self.STATE_BUSY
+        log(f"Auto-stop after MAX_RECORD_SECONDS={MAX_RECORD_SECONDS}")
+        notify_force(APP_NAME, f"Auto-stopped after {MAX_RECORD_SECONDS}s")
+        self._stop_and_transcribe()
 
     def _stop_and_transcribe(self) -> None:
         self._set_icon(ICON_BUSY, f"{APP_NAME} - transcribing")
@@ -1255,6 +1407,7 @@ class DictateApp:
         threading.Thread(target=self._do_transcribe, daemon=True).start()
 
     def _do_transcribe(self) -> None:
+        self._cancel_max_record_timer()
         try:
             audio = self.recorder.stop()
             duration = len(audio) / SAMPLE_RATE if len(audio) else 0.0
@@ -1359,13 +1512,36 @@ class DictateApp:
         ))
         return pystray.Menu(*items)
 
-    def _build_menu(self) -> pystray.Menu:
+    def _mode_submenu(self) -> pystray.Menu:
         return pystray.Menu(
             pystray.MenuItem(
-                lambda item: f"Toggle dictation ({self.current_hotkey})",
+                "Toggle (press to start, press to stop)",
+                lambda icon, item: self.set_mode("toggle"),
+                checked=lambda item: self.current_mode == "toggle",
+                radio=True,
+            ),
+            pystray.MenuItem(
+                "Hold (press-and-hold to record)",
+                lambda icon, item: self.set_mode("hold"),
+                checked=lambda item: self.current_mode == "hold",
+                radio=True,
+            ),
+        )
+
+    def _build_menu(self) -> pystray.Menu:
+        def toggle_label(_item):
+            if self.current_mode == "hold":
+                return f"Toggle dictation (hold mode — use {self.current_hotkey})"
+            return f"Toggle dictation ({self.current_hotkey})"
+
+        return pystray.Menu(
+            pystray.MenuItem(
+                toggle_label,
                 lambda icon, item: self.on_toggle(),
                 default=True,
+                enabled=lambda item: self.current_mode == "toggle",
             ),
+            pystray.MenuItem("Mode", self._mode_submenu()),
             pystray.MenuItem("Model", self._model_submenu()),
             pystray.MenuItem("Hotkey", self._hotkey_submenu()),
             pystray.MenuItem(
@@ -1383,6 +1559,7 @@ class DictateApp:
     def quit(self) -> None:
         log("Quit requested.")
         self._stop_event.set()
+        self._cancel_max_record_timer()
         if self._hotkey_listener is not None:
             try:
                 self._hotkey_listener.stop()

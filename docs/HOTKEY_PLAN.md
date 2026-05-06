@@ -85,7 +85,7 @@ Replace `simpledialog.askstring` with a custom `tk.Toplevel`:
   `keysym → pynput-name` lookup table.
 - Keep the existing typed-syntax path as an "Advanced…" link for power users.
 
-### P2 — Push-to-talk hold mode  `[ ]` (M, ~60 LOC, `dictate.py`)
+### P2 — Push-to-talk hold mode  `[x]` (M, ~60 LOC, `dictate.py`)
 
 Optional dual-mode trigger. Toggle remains the default.
 
@@ -152,6 +152,11 @@ menu. Most of this is already in place; just polish the surfaced state.
 4. **P3** — add once P4 is in place; together they cover both conflict classes.
 5. **P2** — if/when push-to-talk demand actually materializes.
 6. **P5** — polish along the way.
+
+## Status
+
+All P0–P5 shipped on `main` as of v0.1.x. Remaining work tracked in
+*Open questions* below; future revisions land in follow-up PRs.
 
 ## Open questions
 
