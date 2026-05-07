@@ -104,6 +104,13 @@ All knobs live at the top of `dictate.py`:
 | `SOUND_VOLUME` | `0.35` | Volume of the built-in tones (0.0–1.0). |
 | `MODEL_OPTIONS` | `["tiny.en", "base.en", "small.en", "medium.en", "large-v3"]` | Choices shown in the tray "Model" submenu. |
 | `CPU_THREADS` | `0` | `0` = let faster-whisper pick. Bumping this can help on machines with lots of cores. |
+| `OVERLAY_WIDTH` / `OVERLAY_HEIGHT` | `360` / `76` | Pixel size of the floating panel. |
+| `OVERLAY_GLASS` | `True` | Try Win11 acrylic backdrop. Falls back to a solid dark panel on older Windows. |
+| `OVERLAY_ROUND` | `True` | Try Win11 rounded corners (no-op on Win10). |
+| `OVERLAY_ACCENT` | `"#5cc8ff"` | Border + status-dot accent color. |
+| `OVERLAY_WAVE_COLOR` | `"#ff6868"` | Live waveform polyline color while recording. |
+| `OVERLAY_TRANSCRIBING_TEXT` | `"Transcribing"` | Label shown during the transcribe phase (waveform is hidden then). |
+| `OVERLAY_PANEL_FALLBACK` | `"#0d1014"` | Solid panel color when acrylic is unavailable. |
 
 After editing, just restart the app. Model, hotkey, and trigger mode are
 exceptions — all three are editable from the tray menu and persisted to

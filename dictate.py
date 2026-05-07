@@ -80,6 +80,31 @@ OVERLAY_POSITION = "top"
 # Distance in pixels from the screen edge.
 OVERLAY_MARGIN = 40
 
+# --- Overlay visual customization (P6) ---------------------------------
+# Pixel size of the floating overlay. Width drives waveform resolution.
+OVERLAY_WIDTH = 360
+OVERLAY_HEIGHT = 76
+
+# Try to apply Win11 acrylic / mica backdrop. Falls back to a solid dark
+# panel on older Windows or if the DWM call fails.
+OVERLAY_GLASS = True
+
+# Try to apply Win11 rounded corners. Silently no-ops on Win10 and below.
+OVERLAY_ROUND = True
+
+# Border + accent color (used for the 1px outline and the recording dot).
+OVERLAY_ACCENT = "#5cc8ff"
+
+# Waveform polyline color while recording.
+OVERLAY_WAVE_COLOR = "#ff6868"
+
+# Status text shown in the transcribing state. Recording state intentionally
+# shows no label -- the waveform is the indicator.
+OVERLAY_TRANSCRIBING_TEXT = "Transcribing"
+
+# Solid panel color used when DWM acrylic is unavailable.
+OVERLAY_PANEL_FALLBACK = "#0d1014"
+
 # Models selectable from the tray menu. Smaller = faster, less accurate.
 # Order matters: this is how they appear in the menu.
 MODEL_OPTIONS = ["tiny.en", "base.en", "small.en", "medium.en", "large-v3"]
@@ -94,6 +119,7 @@ import sys
 import re
 import io
 import json
+import math
 import time
 import queue
 import struct
@@ -112,7 +138,7 @@ import pyperclip
 from pynput import keyboard
 from pynput.keyboard import Controller as KeyController, Key
 
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw
 import pystray
 import tkinter as tk
 
@@ -307,6 +333,48 @@ def probe_hotkey_conflict(spec: str) -> tuple[bool, str]:
     return True, ""
 
 
+# --- DWM glass + rounded-corner helpers (P6) ---------------------------
+# Win11 22H2+ exposes the system backdrop attribute (acrylic / mica) and a
+# corner-preference attribute via DwmSetWindowAttribute. Both calls are
+# best-effort: failures fall through silently and the overlay degrades to a
+# solid dark panel with sharp corners.
+
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20      # bool — flips DWM to dark theme
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33     # int  — 0=default 1=donotround 2=round 3=roundsmall
+_DWMWA_SYSTEMBACKDROP_TYPE = 38          # int  — 1=auto 2=mainwindow(mica) 3=transientwindow(acrylic) 4=tabbedwindow
+
+_DWMWCP_ROUND = 2
+_DWMSBT_TRANSIENTWINDOW = 3
+
+
+def _dwm_set_attribute(hwnd: int, attr: int, value: int) -> bool:
+    if not hwnd:
+        return False
+    try:
+        v = ctypes.c_int(value)
+        hr = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            ctypes.c_void_p(hwnd), ctypes.c_uint(attr),
+            ctypes.byref(v), ctypes.sizeof(v),
+        )
+        return hr == 0
+    except Exception as e:
+        log(f"DwmSetWindowAttribute({attr}) failed: {e}")
+        return False
+
+
+def _dwm_apply_acrylic(hwnd: int) -> bool:
+    """Try to enable Win11 transient acrylic backdrop. Sets dark mode hint
+    so the system uses dark acrylic instead of light. Returns True on
+    success."""
+    dark_ok = _dwm_set_attribute(hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE, 1)
+    glass_ok = _dwm_set_attribute(hwnd, _DWMWA_SYSTEMBACKDROP_TYPE, _DWMSBT_TRANSIENTWINDOW)
+    return glass_ok and dark_ok
+
+
+def _dwm_apply_rounded(hwnd: int) -> bool:
+    return _dwm_set_attribute(hwnd, _DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_ROUND)
+
+
 # --- Hold-mode chord tracker (P2) --------------------------------------
 # pynput's built-in HotKey class only fires on chord activation (all keys
 # down). Hold-to-talk needs the deactivation edge too. _HoldChord is fed
@@ -463,61 +531,48 @@ ICON_BUSY = _make_icon((220, 180, 60, 255))      # amber
 
 
 # ---------------------------------------------------------------------
-# Recording overlay (always-on-top mic indicator)
+# Recording overlay -- glass panel with live waveform (P6)
 # ---------------------------------------------------------------------
 
-def _make_mic_image(size: int = 36, color=(255, 90, 90, 255)) -> Image.Image:
-    """Draw a clean microphone glyph on a transparent background."""
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    cx = size // 2
-    cap_w = int(size * 0.32)
-    cap_top = int(size * 0.18)
-    cap_bot = int(size * 0.62)
-    # capsule body
-    d.rounded_rectangle(
-        [cx - cap_w // 2, cap_top, cx + cap_w // 2, cap_bot],
-        radius=cap_w // 2, fill=color,
-    )
-    # U-shaped stand
-    arc_l = cx - int(cap_w * 0.95)
-    arc_r = cx + int(cap_w * 0.95)
-    arc_t = int(size * 0.42)
-    arc_b = int(size * 0.78)
-    d.arc([arc_l, arc_t, arc_r, arc_b], start=0, end=180, fill=color, width=3)
-    # post
-    post_top = int((arc_t + arc_b) / 2)
-    post_bot = int(size * 0.88)
-    d.line([cx, post_top, cx, post_bot], fill=color, width=3)
-    # base
-    base_w = int(cap_w * 0.9)
-    d.line([cx - base_w // 2, post_bot, cx + base_w // 2, post_bot], fill=color, width=3)
-    return img
-
-
 class RecordingOverlay:
-    """Frameless always-on-top window with a mic glyph + status text.
+    """Always-on-top floating panel with a glass background and a live audio
+    waveform. Runs its own tk.Tk root on a dedicated thread; all public
+    methods marshal onto that thread via root.after.
 
-    tkinter must run on its own thread; show()/hide()/set_state() are
-    thread-safe and marshal onto that thread via root.after.
+    Recording state: red waveform polyline driven by Recorder.peek_recent_samples.
+    Transcribing state: pulsing amber dot + label (waveform hidden, since the
+    audio stream has stopped).
     """
 
-    BG = "#1a1a1a"
-    TRANSPARENT_KEY = "#010203"  # arbitrary near-black we treat as alpha key
+    BG_KEY = "#010203"          # transparent-color magic key (matches root + canvas bg)
+    TEXT_COLOR = "#e8eef5"
+    DOT_RECORDING = "#ff6868"
+    DOT_TRANSCRIBING = "#f0c85a"
+    POLL_MS = 33                # ~30 fps refresh
+    WAVE_DURATION_S = 0.15      # window of audio shown in the waveform
 
-    STATES = {
-        "recording":    {"text": "Recording",    "color": (255, 90, 90, 255),  "fg": "#ff6868"},
-        "transcribing": {"text": "Transcribing", "color": (240, 200, 90, 255), "fg": "#f0c85a"},
-    }
-
-    def __init__(self):
+    def __init__(self, recorder: "Recorder"):
+        self._recorder = recorder
         self._thread: threading.Thread | None = None
         self._root: tk.Tk | None = None
-        self._frame: tk.Frame | None = None
-        self._icon_label: tk.Label | None = None
-        self._text_label: tk.Label | None = None
-        self._photos: dict = {}
+        self._canvas: tk.Canvas | None = None
+        self._wave_id: int = 0
+        self._dot_id: int = 0
+        self._text_id: int = 0
+        self._border_id: int = 0
+        self._panel_bg_id: int = 0
+        self._state: str = "recording"
+        self._visible: bool = False
+        self._poll_handle = None
+        self._pulse_phase: float = 0.0
+        self._glass_ok: bool = False
+        self._fx_applied: bool = False
+        self._wave_points: int = 0
+        self._wave_x0: int = 0
+        self._wave_x1: int = 0
         self._ready = threading.Event()
+
+    # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
         if self._thread is not None:
@@ -532,39 +587,63 @@ class RecordingOverlay:
             root.withdraw()
             root.overrideredirect(True)
             root.attributes("-topmost", True)
-            root.attributes("-alpha", 0.93)
-            root.configure(bg=self.BG)
-            try:
-                root.attributes("-transparentcolor", self.TRANSPARENT_KEY)
-            except Exception:
-                pass
+            root.geometry(f"{OVERLAY_WIDTH}x{OVERLAY_HEIGHT}")
+            root.resizable(False, False)
+            root.configure(bg=self.BG_KEY)
 
-            frame = tk.Frame(root, bg=self.BG, padx=14, pady=8)
-            frame.pack()
-
-            # Pre-render mic glyphs for each state.
-            for name, cfg in self.STATES.items():
-                pil = _make_mic_image(size=28, color=cfg["color"])
-                self._photos[name] = ImageTk.PhotoImage(pil, master=root)
-
-            initial = self.STATES["recording"]
-            self._icon_label = tk.Label(frame, image=self._photos["recording"], bg=self.BG)
-            self._icon_label.pack(side="left", padx=(0, 10))
-            self._text_label = tk.Label(
-                frame, text=initial["text"], bg=self.BG, fg=initial["fg"],
-                font=("Segoe UI", 11, "bold"),
+            canvas = tk.Canvas(
+                root,
+                width=OVERLAY_WIDTH, height=OVERLAY_HEIGHT,
+                bg=self.BG_KEY,
+                highlightthickness=0, borderwidth=0,
             )
-            self._text_label.pack(side="left")
+            canvas.pack(fill="both", expand=True)
 
+            # Solid panel rectangle -- only painted if DWM acrylic falls through.
+            self._panel_bg_id = canvas.create_rectangle(
+                0, 0, OVERLAY_WIDTH, OVERLAY_HEIGHT,
+                fill="", outline="", width=0,
+            )
+            # 1px accent border, inset 0.5 so it renders crisp.
+            self._border_id = canvas.create_rectangle(
+                1, 1, OVERLAY_WIDTH - 1, OVERLAY_HEIGHT - 1,
+                outline=OVERLAY_ACCENT, width=1,
+            )
+            # Status dot (top-left area).
+            self._dot_id = canvas.create_oval(
+                14, OVERLAY_HEIGHT // 2 - 4,
+                22, OVERLAY_HEIGHT // 2 + 4,
+                fill=self.DOT_RECORDING, outline="",
+            )
+            # Waveform line area: from just right of dot to just before edge.
+            self._wave_x0 = 32
+            self._wave_x1 = OVERLAY_WIDTH - 16
+            self._wave_points = max(20, (self._wave_x1 - self._wave_x0) // 3)
+            cy = OVERLAY_HEIGHT // 2
+            flat = []
+            for i in range(self._wave_points):
+                x = self._wave_x0 + (self._wave_x1 - self._wave_x0) * i / max(1, self._wave_points - 1)
+                flat.extend([x, cy])
+            self._wave_id = canvas.create_line(
+                *flat,
+                fill=OVERLAY_WAVE_COLOR, width=2, smooth=True, capstyle="round",
+            )
+            # Centered status text (used for transcribing).
+            self._text_id = canvas.create_text(
+                OVERLAY_WIDTH // 2, OVERLAY_HEIGHT // 2,
+                text="", fill=self.TEXT_COLOR,
+                font=("Segoe UI", 12, "bold"),
+            )
+
+            self._canvas = canvas
             self._root = root
-            self._frame = frame
             self._ready.set()
             root.mainloop()
         except Exception as e:
             log(f"overlay thread error: {e}\n{traceback.format_exc()}")
             self._ready.set()
 
-    # --- thread-safe public API ---------------------------------------
+    # -- thread-safe public API -------------------------------------------
 
     def show(self, state: str = "recording") -> None:
         if self._root is None:
@@ -598,31 +677,50 @@ class RecordingOverlay:
         except Exception:
             pass
 
-    # --- runs on overlay thread ---------------------------------------
-
-    def _do_set_state(self, state: str) -> None:
-        cfg = self.STATES.get(state)
-        if not cfg or self._icon_label is None or self._text_label is None:
-            return
-        self._icon_label.configure(image=self._photos[state])
-        self._text_label.configure(text=cfg["text"], fg=cfg["fg"])
+    # -- overlay-thread handlers ------------------------------------------
 
     def _do_show(self, state: str) -> None:
-        self._do_set_state(state)
-        self._root.update_idletasks()
         self._reposition()
+        self._do_set_state(state)
         self._root.deiconify()
         self._root.lift()
         self._root.attributes("-topmost", True)
+        self._visible = True
+        if not self._fx_applied:
+            self._apply_window_effects()
+            self._fx_applied = True
+        self._tick()
+
+    def _do_set_state(self, state: str) -> None:
+        if self._canvas is None:
+            return
+        self._state = state
+        if state == "recording":
+            self._canvas.itemconfigure(self._dot_id, fill=self.DOT_RECORDING)
+            self._canvas.itemconfigure(self._text_id, text="")
+            self._canvas.itemconfigure(self._wave_id, state="normal", fill=OVERLAY_WAVE_COLOR)
+        elif state == "transcribing":
+            self._canvas.itemconfigure(self._dot_id, fill=self.DOT_TRANSCRIBING)
+            self._canvas.itemconfigure(
+                self._text_id, text=OVERLAY_TRANSCRIBING_TEXT, fill=self.DOT_TRANSCRIBING,
+            )
+            self._canvas.itemconfigure(self._wave_id, state="hidden")
 
     def _do_hide(self) -> None:
+        self._visible = False
+        if self._poll_handle is not None:
+            try:
+                self._root.after_cancel(self._poll_handle)
+            except Exception:
+                pass
+            self._poll_handle = None
         self._root.withdraw()
 
     def _reposition(self) -> None:
         sw = self._root.winfo_screenwidth()
         sh = self._root.winfo_screenheight()
-        ww = max(self._root.winfo_width(), self._root.winfo_reqwidth())
-        wh = max(self._root.winfo_height(), self._root.winfo_reqheight())
+        ww = OVERLAY_WIDTH
+        wh = OVERLAY_HEIGHT
         pos = (OVERLAY_POSITION or "top").lower()
         if pos == "bottom":
             x = (sw - ww) // 2
@@ -633,7 +731,109 @@ class RecordingOverlay:
         else:  # "top"
             x = (sw - ww) // 2
             y = OVERLAY_MARGIN
-        self._root.geometry(f"+{x}+{y}")
+        self._root.geometry(f"{ww}x{wh}+{x}+{y}")
+
+    def _apply_window_effects(self) -> None:
+        """Try DWM acrylic + rounded corners. On failure, fall back to a
+        solid dark panel so the overlay is still legible."""
+        try:
+            inner = self._root.winfo_id()
+            top = ctypes.windll.user32.GetParent(inner)
+            hwnd = top if top else inner
+        except Exception as e:
+            log(f"overlay HWND lookup failed: {e}")
+            self._fallback_panel()
+            return
+
+        if OVERLAY_ROUND:
+            _dwm_apply_rounded(hwnd)
+
+        glass = _dwm_apply_acrylic(hwnd) if OVERLAY_GLASS else False
+        self._glass_ok = glass
+
+        if glass:
+            try:
+                self._root.attributes("-transparentcolor", self.BG_KEY)
+            except Exception as e:
+                log(f"overlay transparentcolor failed: {e}")
+                self._fallback_panel()
+        else:
+            self._fallback_panel()
+
+    def _fallback_panel(self) -> None:
+        """Solid dark fill behind canvas content when acrylic is unavailable."""
+        if self._canvas is None:
+            return
+        self._canvas.itemconfigure(self._panel_bg_id, fill=OVERLAY_PANEL_FALLBACK)
+        try:
+            self._root.attributes("-alpha", 0.94)
+        except Exception:
+            pass
+
+    # -- per-frame draw ---------------------------------------------------
+
+    def _tick(self) -> None:
+        if not self._visible or self._canvas is None or self._root is None:
+            return
+        if self._state == "recording":
+            self._draw_wave()
+        elif self._state == "transcribing":
+            self._draw_pulse()
+        try:
+            self._poll_handle = self._root.after(self.POLL_MS, self._tick)
+        except Exception:
+            self._poll_handle = None
+
+    def _draw_wave(self) -> None:
+        try:
+            samples = self._recorder.peek_recent_samples(self.WAVE_DURATION_S)
+        except Exception as e:
+            log(f"overlay peek error: {e}")
+            return
+        N = self._wave_points
+        if samples.size < 4:
+            ds = np.zeros(N, dtype=np.float32)
+        else:
+            step = max(1, len(samples) // N)
+            ds = samples[::step][:N]
+            if len(ds) < N:
+                ds = np.concatenate([np.zeros(N - len(ds), dtype=np.float32), ds])
+        # Normalize so a normal speaking voice fills most of the panel without
+        # clipping; very quiet input stays visibly small instead of jumping to
+        # full amplitude.
+        peak = float(np.max(np.abs(ds))) if ds.size else 0.0
+        floor = 0.05
+        if peak < 1e-4:
+            norm = ds  # silence: flat line
+        else:
+            scale = 1.0 / max(peak, floor)
+            norm = ds * scale
+            if peak < floor:
+                norm = norm * (peak / floor)
+        cy = OVERLAY_HEIGHT // 2
+        amp = (OVERLAY_HEIGHT // 2) - 10
+        x0, x1 = self._wave_x0, self._wave_x1
+        denom = max(1, N - 1)
+        pts: list[float] = []
+        for i in range(N):
+            x = x0 + (x1 - x0) * i / denom
+            y = cy - float(norm[i]) * amp
+            pts.append(x)
+            pts.append(y)
+        try:
+            self._canvas.coords(self._wave_id, *pts)
+        except Exception as e:
+            log(f"overlay coords error: {e}")
+
+    def _draw_pulse(self) -> None:
+        self._pulse_phase += self.POLL_MS / 1000.0 * 4.0  # ~4 rad/s
+        s = (math.sin(self._pulse_phase) + 1.0) / 2.0  # 0..1
+        r = 4.0 + 3.0 * s
+        cx, cy = 18.0, OVERLAY_HEIGHT / 2.0
+        try:
+            self._canvas.coords(self._dot_id, cx - r, cy - r, cx + r, cy + r)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------
@@ -965,6 +1165,30 @@ class Recorder:
             self._chunks = []
         return audio
 
+    def peek_recent_samples(self, seconds: float) -> np.ndarray:
+        """Return up to `seconds` worth of the most recent audio without
+        consuming it. Safe to call from another thread; cheap because we
+        only walk the tail of the chunk list.
+        """
+        n_target = int(seconds * SAMPLE_RATE)
+        if n_target <= 0:
+            return np.zeros(0, dtype=np.float32)
+        with self._lock:
+            if not self._chunks:
+                return np.zeros(0, dtype=np.float32)
+            tail: list[np.ndarray] = []
+            total = 0
+            for chunk in reversed(self._chunks):
+                tail.append(chunk)
+                total += len(chunk)
+                if total >= n_target:
+                    break
+            tail.reverse()
+            audio = np.concatenate(tail, axis=0).flatten()
+        if len(audio) > n_target:
+            audio = audio[-n_target:]
+        return audio
+
 
 # ---------------------------------------------------------------------
 # Text cleanup
@@ -1022,7 +1246,7 @@ class DictateApp:
         self.recorder = Recorder()
         self.model: WhisperModel | None = None
         self.icon: pystray.Icon | None = None
-        self.overlay = RecordingOverlay() if SHOW_OVERLAY else None
+        self.overlay = RecordingOverlay(self.recorder) if SHOW_OVERLAY else None
         self._stop_event = threading.Event()
 
         cfg = load_user_config()
