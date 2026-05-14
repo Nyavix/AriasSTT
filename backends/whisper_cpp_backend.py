@@ -293,7 +293,7 @@ class WhisperCppBackend(Backend):
             headers={"Content-Type": content_type},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=3600) as resp:
             payload = resp.read().decode("utf-8", "replace")
 
         try:

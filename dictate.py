@@ -21,6 +21,12 @@ Run with `pythonw dictate.py` to suppress the console window.
 # launch (before config.json exists).
 HOTKEY = "<ctrl>+<alt>+<space>"
 
+# Cancel hotkey. Aborts the current recording (audio discarded) or, if pressed
+# while a transcription is already in flight, drops the result before it
+# reaches the clipboard. Independent of the main toggle/hold listener so it
+# fires in every mode. Persisted to config.json after first launch.
+CANCEL_HOTKEY = "<ctrl>+<f9>"
+
 # Hotkey presets shown in the tray "Hotkey" submenu. Each entry is
 # (pynput_spec, warning) -- warning is None for combos with no known conflict,
 # or a short string shown next to the menu label.
@@ -70,6 +76,10 @@ SOUND_STOP = None   # e.g. r"C:\path\to\stop.wav"
 
 # Master volume for the built-in synthesized tones (0.0 - 1.0).
 SOUND_VOLUME = 0.35
+
+# Sound preset for the built-in tones. Options: "default", "subtle", "click".
+# Overridable at runtime via the tray Sound submenu (persisted in config.json).
+SOUND_PRESET = "default"
 
 # Show a small always-on-top mic overlay while recording / transcribing.
 SHOW_OVERLAY = True
@@ -170,7 +180,7 @@ from backends import Backend, FasterWhisperBackend, WhisperCppBackend
 
 
 APP_NAME = "AriasSTT"
-__version__ = "0.2.1"  # bumped in CI on tag push; user visible via update flow
+__version__ = "0.3.2"  # bumped in CI on tag push; user visible via update flow
 LOG_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME / "ariasstt.log"
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -579,11 +589,12 @@ def _make_wav_tone(segments: list, sample_rate: int = 44100, volume: float = 0.3
     return header + pcm
 
 
-# Built-in tones: rising for start, falling for stop. Short and gentle.
-# Written to disk at module load — winsound's SND_MEMORY path is flaky on
-# some Windows audio configs; SND_FILENAME is rock-solid.
-_START_WAV_BYTES = _make_wav_tone([(660, 0.06), (990, 0.09)], volume=SOUND_VOLUME)
-_STOP_WAV_BYTES  = _make_wav_tone([(880, 0.06), (587, 0.10)], volume=SOUND_VOLUME)
+# Preset tone definitions. Each entry: start/stop note sequences + volume.
+SOUND_PRESETS = {
+    "default": {"start": [(660, 0.06), (990, 0.09)], "stop": [(880, 0.06), (587, 0.10)], "volume": 0.35},
+    "subtle":  {"start": [(880, 0.05)],               "stop": [(660, 0.05)],              "volume": 0.18},
+    "click":   {"start": [(1200, 0.03)],              "stop": [(900, 0.03)],              "volume": 0.22},
+}
 
 
 def _write_temp_wav(data: bytes, name: str) -> str | None:
@@ -597,8 +608,21 @@ def _write_temp_wav(data: bytes, name: str) -> str | None:
         return None
 
 
-_START_WAV_PATH = _write_temp_wav(_START_WAV_BYTES, "start")
-_STOP_WAV_PATH  = _write_temp_wav(_STOP_WAV_BYTES, "stop")
+# Pre-generate a temp WAV file for every preset so switching is instant.
+_PRESET_WAV_PATHS: dict[str, dict[str, str | None]] = {}
+for _pname, _pdef in SOUND_PRESETS.items():
+    _PRESET_WAV_PATHS[_pname] = {
+        "start": _write_temp_wav(
+            _make_wav_tone(_pdef["start"], volume=_pdef["volume"]), f"preset_{_pname}_start"
+        ),
+        "stop": _write_temp_wav(
+            _make_wav_tone(_pdef["stop"], volume=_pdef["volume"]), f"preset_{_pname}_stop"
+        ),
+    }
+
+# Runtime-mutable sound state; updated by DictateApp, read by play_sound.
+_sounds_muted: bool = False
+_current_preset: str = "default"
 
 
 def _beep_fallback(kind: str) -> None:
@@ -614,7 +638,7 @@ def _beep_fallback(kind: str) -> None:
 
 def play_sound(kind: str) -> None:
     """kind = 'start' or 'stop'. Always returns immediately."""
-    if not PLAY_SOUNDS:
+    if not PLAY_SOUNDS or _sounds_muted:
         return
 
     def _play():
@@ -628,8 +652,9 @@ def play_sound(kind: str) -> None:
             except Exception as e:
                 log(f"PlaySound({custom}) failed: {e}")
 
-        # 2. Built-in synthesized WAV from temp file
-        path = _START_WAV_PATH if kind == "start" else _STOP_WAV_PATH
+        # 2. Preset synthesized WAV
+        preset_paths = _PRESET_WAV_PATHS.get(_current_preset) or _PRESET_WAV_PATHS.get("default", {})
+        path = preset_paths.get(kind)
         if path and os.path.isfile(path):
             try:
                 winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
@@ -1461,6 +1486,11 @@ class DictateApp:
             log(f"Persisted hotkey {self.current_hotkey!r} invalid; falling back to {HOTKEY}")
             self.current_hotkey = HOTKEY
 
+        self.current_cancel_hotkey: str = cfg.get("cancel_hotkey", CANCEL_HOTKEY)
+        if not is_valid_hotkey(self.current_cancel_hotkey):
+            log(f"Persisted cancel hotkey {self.current_cancel_hotkey!r} invalid; falling back to {CANCEL_HOTKEY}")
+            self.current_cancel_hotkey = CANCEL_HOTKEY
+
         # Inference backend choice. "auto" picks GPU when the bundled
         # whisper.cpp Vulkan binary is present, otherwise CPU.
         self.current_backend: str = cfg.get("backend", BACKEND)
@@ -1483,9 +1513,24 @@ class DictateApp:
             log(f"Persisted mode {self.current_mode!r} invalid; falling back to toggle")
             self.current_mode = "toggle"
 
+        self.sounds_muted: bool = bool(cfg.get("sounds_muted", False))
+        self.sound_preset: str = cfg.get("sound_preset", SOUND_PRESET)
+        if self.sound_preset not in SOUND_PRESETS:
+            self.sound_preset = "default"
+        global _sounds_muted, _current_preset
+        _sounds_muted = self.sounds_muted
+        _current_preset = self.sound_preset
+
         self._hotkey_listener = None  # keyboard.GlobalHotKeys or keyboard.Listener
         self._hotkey_bound: bool = False
         self._hotkey_last_error: str | None = None
+
+        # Cancel hotkey runs on its own GlobalHotKeys listener so it works in
+        # both toggle and hold modes without entangling with the main
+        # press/release matcher. Set on cancel-during-busy so the in-flight
+        # transcription's result is dropped before clipboard/paste.
+        self._cancel_listener = None
+        self._cancel_event = threading.Event()
 
         # Dead-man's switch: forces a stop after MAX_RECORD_SECONDS even if
         # the chord release is missed (relevant for hold mode, but covers
@@ -1501,10 +1546,13 @@ class DictateApp:
 
     def _save_config(self) -> None:
         save_user_config({
-            "model":   self.current_model,
-            "hotkey":  self.current_hotkey,
-            "mode":    self.current_mode,
-            "backend": self.current_backend,
+            "model":         self.current_model,
+            "hotkey":        self.current_hotkey,
+            "cancel_hotkey": self.current_cancel_hotkey,
+            "mode":          self.current_mode,
+            "backend":       self.current_backend,
+            "sounds_muted":  self.sounds_muted,
+            "sound_preset":  self.sound_preset,
         })
 
     # -- model -------------------------------------------------------
@@ -1671,6 +1719,30 @@ class DictateApp:
             log(f"Hotkey listener crashed: {e}\n{traceback.format_exc()}")
             notify_error(APP_NAME, f"Hotkey error: {e}")
             self._refresh_tooltip()
+        self._start_cancel_listener()
+
+    def _start_cancel_listener(self) -> None:
+        """(Re)bind the cancel hotkey listener. Skipped when the cancel chord
+        collides with the main hotkey, since both listeners would otherwise
+        fire on the same press."""
+        if self._cancel_listener is not None:
+            try:
+                self._cancel_listener.stop()
+            except Exception as e:
+                log(f"Stop old cancel listener failed: {e}")
+            self._cancel_listener = None
+        if self.current_cancel_hotkey == self.current_hotkey:
+            log(f"Cancel hotkey matches main hotkey ({self.current_hotkey!r}); cancel disabled")
+            return
+        try:
+            listener = keyboard.GlobalHotKeys(
+                {self.current_cancel_hotkey: self.on_cancel}
+            )
+            listener.start()
+            self._cancel_listener = listener
+            log(f"Cancel hotkey listener bound: {self.current_cancel_hotkey}")
+        except Exception as e:
+            log(f"Cancel hotkey listener failed: {e}\n{traceback.format_exc()}")
 
     def _build_hold_listener(self, spec: str) -> "keyboard.Listener":
         """Build a `keyboard.Listener` driving a _HoldChord matcher."""
@@ -2009,7 +2081,49 @@ class DictateApp:
         else:
             self._stop_and_transcribe()
 
+    def on_cancel(self) -> None:
+        """Cancel hotkey callback.
+
+        - idle: no-op.
+        - recording: stop mic, discard audio, return to idle.
+        - busy (transcribing): set the cancel event so `_do_transcribe`
+          drops the result before clipboard / paste. Inference still runs
+          to completion -- faster-whisper has no interrupt API and aborting
+          the whisper-server HTTP call would just leave a half-warmed
+          process behind.
+        """
+        with self._state_lock:
+            if self.state == self.STATE_IDLE:
+                log("Cancel ignored: idle.")
+                return
+            if self.state == self.STATE_RECORDING:
+                self.state = self.STATE_BUSY  # block toggle during teardown
+                cancel_recording = True
+            else:
+                cancel_recording = False
+
+        if cancel_recording:
+            self._cancel_recording()
+        else:
+            self._cancel_event.set()
+            log("Cancel requested during transcription; result will be dropped.")
+
+    def _cancel_recording(self) -> None:
+        self._cancel_max_record_timer()
+        try:
+            self.recorder.stop()  # discard the audio buffer
+        except Exception as e:
+            log(f"Recorder stop during cancel failed: {e}")
+        play_sound("stop")
+        log("Recording cancelled.")
+        with self._state_lock:
+            self.state = self.STATE_IDLE
+        self._set_icon(ICON_IDLE, f"{APP_NAME} - idle ({self.current_model})")
+        if self.overlay is not None:
+            self.overlay.hide()
+
     def _start_recording(self) -> None:
+        self._cancel_event.clear()
         try:
             self.recorder.start()
         except Exception as e:
@@ -2074,6 +2188,11 @@ class DictateApp:
             duration = len(audio) / SAMPLE_RATE if len(audio) else 0.0
             log(f"Recording stopped: {duration:.2f}s, {len(audio)} samples")
 
+            if self._cancel_event.is_set():
+                play_sound("stop")
+                log("Transcription cancelled before inference; audio dropped.")
+                return
+
             if duration < 0.25:
                 play_sound("stop")
                 log("Recording too short, ignored.")
@@ -2083,6 +2202,12 @@ class DictateApp:
             text = self._transcribe(audio)
             log(f"Inference took {time.time() - t0:.2f}s ({self.current_model})")
             text = clean_text(text)
+
+            if self._cancel_event.is_set():
+                play_sound("stop")
+                log(f"Transcription cancelled; dropping {len(text)} chars.")
+                return
+
             if not text:
                 play_sound("stop")
                 log("Empty transcription.")
@@ -2198,6 +2323,52 @@ class DictateApp:
             ),
         )
 
+    def set_sounds_muted(self, muted: bool) -> None:
+        global _sounds_muted
+        self.sounds_muted = muted
+        _sounds_muted = muted
+        self._save_config()
+        log(f"Sounds {'muted' if muted else 'unmuted'}")
+
+    def set_sound_preset(self, preset: str) -> None:
+        global _current_preset
+        if preset not in SOUND_PRESETS:
+            return
+        self.sound_preset = preset
+        _current_preset = preset
+        self._save_config()
+        log(f"Sound preset: {preset}")
+        play_sound("start")
+
+    def _sound_submenu(self) -> pystray.Menu:
+        items: list = [
+            pystray.MenuItem(
+                "Mute",
+                lambda icon, item: self.set_sounds_muted(not self.sounds_muted),
+                checked=lambda item: self.sounds_muted,
+            ),
+            pystray.Menu.SEPARATOR,
+        ]
+        for name in SOUND_PRESETS:
+            items.append(pystray.MenuItem(
+                name.capitalize(),
+                (lambda n: lambda icon, item: self.set_sound_preset(n))(name),
+                checked=(lambda n: lambda item: self.sound_preset == n)(name),
+                radio=True,
+                enabled=lambda item: not self.sounds_muted,
+            ))
+        items.extend([
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Test sound",
+                lambda icon, item: (
+                    play_sound("start"),
+                    threading.Timer(0.6, lambda: play_sound("stop")).start(),
+                ),
+            ),
+        ])
+        return pystray.Menu(*items)
+
     def _build_menu(self) -> pystray.Menu:
         def toggle_label(_item):
             if self.current_mode == "hold":
@@ -2215,10 +2386,7 @@ class DictateApp:
             pystray.MenuItem("Model", self._model_submenu()),
             pystray.MenuItem("Backend", self._backend_submenu()),
             pystray.MenuItem("Hotkey", self._hotkey_submenu()),
-            pystray.MenuItem(
-                "Test sound",
-                lambda icon, item: (play_sound("start"), threading.Timer(0.6, lambda: play_sound("stop")).start()),
-            ),
+            pystray.MenuItem("Sound", self._sound_submenu()),
             pystray.MenuItem(
                 "Open log folder",
                 lambda icon, item: os.startfile(str(LOG_PATH.parent)),
@@ -2253,6 +2421,12 @@ class DictateApp:
             except Exception:
                 pass
             self._hotkey_listener = None
+        if self._cancel_listener is not None:
+            try:
+                self._cancel_listener.stop()
+            except Exception:
+                pass
+            self._cancel_listener = None
         try:
             self.recorder.stop()
         except Exception:

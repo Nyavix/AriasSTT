@@ -10,7 +10,7 @@
 ; ----------------------------------------------------------------------
 
 #define MyAppName       "AriasSTT"
-#define MyAppVersion    "0.2.1"
+#define MyAppVersion    "0.3.2"
 #define MyAppPublisher  "Nyavix"
 #define MyAppURL        "https://github.com/Nyavix/AriasSTT"
 #define MyAppExeName    "AriasSTT.exe"

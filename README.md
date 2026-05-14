@@ -91,6 +91,7 @@ All knobs live at the top of `dictate.py`:
 | Variable | Default | Notes |
 |---|---|---|
 | `HOTKEY` | `"<ctrl>+<alt>+<space>"` | Initial hotkey (overridable from the tray menu — see "Changing the hotkey"). [pynput GlobalHotKeys syntax](https://pynput.readthedocs.io/en/latest/keyboard.html#global-hotkeys). Examples: `"<f9>"`, `"<ctrl>+<shift>+d"` |
+| `CANCEL_HOTKEY` | `"<ctrl>+<f9>"` | Abort the current recording (audio dropped) or, if pressed while transcription is in flight, drop the result before it's pasted. Same pynput syntax as `HOTKEY`. Persisted in `config.json` as `cancel_hotkey`. Disabled if it collides with `HOTKEY`. |
 | `HOTKEY_PRESETS` | tuples of `(spec, warning)` — see source | Choices shown in the tray "Hotkey" submenu. Combos with a non-`None` warning render with a ⚠ marker (e.g. `Ctrl+Shift+M ⚠ Teams/Outlook mute`). |
 | `MODEL_SIZE` | `"medium.en"` | `tiny.en`, `base.en`, `small.en`, `medium.en`, `large-v3` |
 | `COMPUTE_TYPE` | `"int8"` | `int8` is fastest on CPU; try `int8_float32` if accuracy suffers |
@@ -102,6 +103,7 @@ All knobs live at the top of `dictate.py`:
 | `PLAY_SOUNDS` | `True` | Short start/stop tone played via `winsound`. |
 | `SOUND_START` / `SOUND_STOP` | `None` | Optional path to a custom `.wav`. `None` uses the built-in synthesized tones. |
 | `SOUND_VOLUME` | `0.35` | Volume of the built-in tones (0.0–1.0). |
+| `SOUND_PRESET` | `"default"` | Initial tone style: `"default"` (two-note ding), `"subtle"` (single soft note), `"click"` (short click). Changeable at runtime via tray → Sound. |
 | `MODEL_OPTIONS` | `["tiny.en", "base.en", "small.en", "medium.en", "large-v3"]` | Choices shown in the tray "Model" submenu. |
 | `CPU_THREADS` | `0` | `0` = let faster-whisper pick. Bumping this can help on machines with lots of cores. |
 | `BACKEND` | `"auto"` | `"auto"` picks GPU when `whisper-server.exe` is bundled and Vulkan is available, otherwise CPU. `"gpu"` forces GPU (errors if unavailable). `"cpu"` forces faster-whisper. |
@@ -185,7 +187,13 @@ SOUND_START = r"C:\Users\you\Sounds\ding.wav"
 SOUND_STOP  = r"C:\Users\you\Sounds\dong.wav"
 ```
 
-To silence sounds entirely, set `PLAY_SOUNDS = False`.
+To mute without restarting, right-click the tray → **Sound** → **Mute**. This is
+saved to `config.json` and survives restarts.
+
+To pick a different tone style, right-click the tray → **Sound** → choose
+**Default**, **Subtle**, or **Click**.
+
+To silence sounds entirely at the code level, set `PLAY_SOUNDS = False`.
 
 ### Changing the hotkey
 
