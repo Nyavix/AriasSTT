@@ -25,6 +25,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,6 +53,13 @@ HF_BASE = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
 # medium.en takes ~5-15 s on a typical AMD GPU.  Larger models on slower
 # machines need more headroom.
 SERVER_BOOT_TIMEOUT_S = 60.0
+
+# Maximum bytes of whisper-server stdout+stderr to retain in memory for
+# crash diagnostics.  Drainer threads truncate the ring buffer to this
+# size; without active draining the OS pipe buffer (~4-64 KB on Windows)
+# fills after a few inferences and the server deadlocks on its next
+# write.
+SERVER_LOG_TAIL_BYTES = 16 * 1024
 
 
 # ----------------------------------------------------------------------
@@ -113,6 +121,8 @@ class WhisperCppBackend(Backend):
         self.port: int | None = None
         self.model_name: str | None = None
         self._stderr_tail: str = ""
+        self._tail_lock = threading.Lock()
+        self._drain_threads: list[threading.Thread] = []
 
     # ------------------------------------------------------------------
     # Availability
@@ -199,6 +209,19 @@ class WhisperCppBackend(Backend):
             raise RuntimeError(f"whisper-server.exe failed to launch: {e}") from e
 
         self.port = port
+
+        # Start drainer threads BEFORE waiting for ready.  whisper-server
+        # writes Vulkan device + model-load progress to stderr during
+        # boot; if we don't drain, even startup can deadlock on larger
+        # models / slower disks.
+        with self._tail_lock:
+            self._stderr_tail = ""
+        self._drain_threads = []
+        if self.proc.stdout is not None:
+            self._start_drainer(self.proc.stdout, "stdout")
+        if self.proc.stderr is not None:
+            self._start_drainer(self.proc.stderr, "stderr")
+
         try:
             self._wait_ready()
         except Exception:
@@ -207,6 +230,31 @@ class WhisperCppBackend(Backend):
 
         self.model_name = model_name
         self._log(f"[backend:gpu] whisper-server ready on :{port}")
+
+    def _start_drainer(self, stream, label: str) -> None:
+        """Pump a subprocess pipe into the bounded tail buffer.
+
+        Without this, the OS pipe buffer fills after a few inferences
+        and whisper-server blocks on its next ``fwrite``, which in turn
+        stalls the next ``/inference`` HTTP request.
+        """
+        def _pump() -> None:
+            try:
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", "replace")
+                    with self._tail_lock:
+                        self._stderr_tail += text
+                        if len(self._stderr_tail) > SERVER_LOG_TAIL_BYTES:
+                            self._stderr_tail = self._stderr_tail[-SERVER_LOG_TAIL_BYTES:]
+            except Exception:
+                pass
+
+        t = threading.Thread(target=_pump, name=f"whisper-srv-{label}", daemon=True)
+        t.start()
+        self._drain_threads.append(t)
 
     def _wait_ready(self) -> None:
         """Poll the server's HTTP root until it responds, with a hard cap."""
@@ -242,22 +290,14 @@ class WhisperCppBackend(Backend):
         )
 
     def _read_stderr_tail(self) -> str:
-        """Drain whatever stderr is buffered without blocking forever.
+        """Return the current bounded stdout+stderr tail.
 
-        The server has already exited (caller checks ``poll()``) before
-        we get here, so the read returns immediately.  We cache the
-        result so a follow-up ``unload()`` call still has something to
-        log.
+        A pair of daemon drainer threads continuously pump the pipes
+        into ``self._stderr_tail`` (capped at ``SERVER_LOG_TAIL_BYTES``)
+        so this call never blocks and never touches the pipe directly.
         """
-        if self.proc is None or self.proc.stderr is None:
+        with self._tail_lock:
             return self._stderr_tail
-        try:
-            data = self.proc.stderr.read() or b""
-        except Exception:
-            data = b""
-        if data:
-            self._stderr_tail += data.decode("utf-8", "replace")
-        return self._stderr_tail
 
     # ------------------------------------------------------------------
     # Inference
@@ -318,11 +358,16 @@ class WhisperCppBackend(Backend):
                             self.proc.wait(timeout=2)
                         except subprocess.TimeoutExpired:
                             pass
-                self._read_stderr_tail()  # capture any final output
+                # Pipes close once the child exits; give the drainer
+                # threads a brief moment to flush the final bytes into
+                # the tail buffer so crash logs are complete.
+                for t in self._drain_threads:
+                    t.join(timeout=1.0)
             except Exception as e:
                 self._log(f"[backend:gpu] unload error: {e}")
             finally:
                 self.proc = None
+        self._drain_threads = []
         self.port = None
         self.model_name = None
 
